@@ -4,6 +4,7 @@ set -euo pipefail
 
 readonly image_tag="${IMAGE_TAG:-openwiki-container:test}"
 readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly default_init_message_snippet="Do not return a plan instead of documentation."
 tmp_root=""
 
 cleanup() {
@@ -83,6 +84,176 @@ test_version_command() {
 
 test_help_command_without_repo_or_credentials() {
   docker run --rm "${image_tag}" code --help >/dev/null
+}
+
+test_auto_mode_uses_init_without_openwiki_dir() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-resolve-mode \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=init'
+  assert_contains "${output_file}" 'REASON=openwiki/ directory not found'
+}
+
+test_auto_mode_uses_update_with_last_update_state() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  mkdir -p "${repo_dir}/openwiki"
+  printf '{"gitHead":"abc"}\n' >"${repo_dir}/openwiki/.last-update.json"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-resolve-mode \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=update'
+  assert_contains "${output_file}" 'REASON=detected openwiki/.last-update.json'
+}
+
+test_auto_mode_uses_update_with_skeleton_only() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  mkdir -p "${repo_dir}/openwiki"
+  printf '# skeleton\n' >"${repo_dir}/openwiki/_skeleton.md"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-resolve-mode \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=update'
+  assert_contains "${output_file}" 'REASON=detected openwiki/_skeleton.md without .last-update.json; treating repository as initialized'
+}
+
+test_auto_mode_fails_for_ambiguous_openwiki_state() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  mkdir -p "${repo_dir}/openwiki"
+  printf 'manual notes\n' >"${repo_dir}/openwiki/custom.md"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  run_expect_failure "${output_file}" \
+    docker run --rm \
+      -v "${repo_dir}:/repo" \
+      -w /repo \
+      -e OPENWIKI_PROVIDER=openai \
+      -e OPENWIKI_MODEL_ID=gpt-5.6-terra \
+      "${image_tag}" \
+      code --print
+
+  assert_contains "${output_file}" 'unable to auto-select OpenWiki mode'
+}
+
+test_init_mode_injects_default_instruction_when_message_missing() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-preview-command \
+    code --print \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=init'
+  assert_contains "${output_file}" 'ARG[0]=code'
+  assert_contains "${output_file}" 'ARG[1]=--init'
+  assert_contains "${output_file}" 'ARG[2]=--print'
+  assert_contains "${output_file}" "${default_init_message_snippet}"
+}
+
+test_init_mode_preserves_explicit_instruction_message() {
+  local repo_dir
+  local output_file
+  local explicit_message
+
+  repo_dir="$(new_fixture_repo)"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+  explicit_message="Write deeply technical repository documentation with concrete file references."
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-preview-command \
+    code --print "${explicit_message}" \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=init'
+  assert_contains "${output_file}" "${explicit_message}"
+  assert_not_contains "${output_file}" "${default_init_message_snippet}"
+}
+
+test_init_mode_uses_custom_init_message_override() {
+  local repo_dir
+  local output_file
+  local custom_message
+
+  repo_dir="$(new_fixture_repo)"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+  custom_message="Produce detailed operational and architectural docs for this repository."
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    -e OPENWIKI_INIT_MESSAGE="${custom_message}" \
+    "${image_tag}" \
+    container-preview-command \
+    code --print \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=init'
+  assert_contains "${output_file}" "${custom_message}"
+  assert_not_contains "${output_file}" "${default_init_message_snippet}"
+}
+
+test_update_mode_does_not_inject_init_instruction() {
+  local repo_dir
+  local output_file
+
+  repo_dir="$(new_fixture_repo)"
+  mkdir -p "${repo_dir}/openwiki"
+  printf '{"gitHead":"abc"}\n' >"${repo_dir}/openwiki/.last-update.json"
+  output_file="$(mktemp "${tmp_root}/output.XXXXXX")"
+
+  docker run --rm \
+    -v "${repo_dir}:/repo" \
+    -w /repo \
+    "${image_tag}" \
+    container-preview-command \
+    code --print \
+    >"${output_file}" 2>&1
+
+  assert_contains "${output_file}" 'MODE=update'
+  assert_contains "${output_file}" 'ARG[0]=code'
+  assert_contains "${output_file}" 'ARG[1]=--update'
+  assert_contains "${output_file}" 'ARG[2]=--print'
+  assert_not_contains "${output_file}" "${default_init_message_snippet}"
 }
 
 test_git_repo_validation() {
@@ -293,6 +464,14 @@ main() {
 
   test_version_command
   test_help_command_without_repo_or_credentials
+  test_auto_mode_uses_init_without_openwiki_dir
+  test_auto_mode_uses_update_with_last_update_state
+  test_auto_mode_uses_update_with_skeleton_only
+  test_auto_mode_fails_for_ambiguous_openwiki_state
+  test_init_mode_injects_default_instruction_when_message_missing
+  test_init_mode_preserves_explicit_instruction_message
+  test_init_mode_uses_custom_init_message_override
+  test_update_mode_does_not_inject_init_instruction
   test_git_repo_validation
   test_explicit_provider_requirement
   test_explicit_model_requirement

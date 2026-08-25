@@ -6,7 +6,7 @@ The image packages the OpenWiki runtime so application repositories do not need 
 
 ## What it does
 
-- runs `openwiki code --update --print` against a mounted repository
+- runs OpenWiki code-documentation commands against a mounted repository
 - writes generated documentation back into the mounted host workspace
 - validates basic container preconditions before invoking OpenWiki
 - preserves OpenWiki's own provider and model configuration contract
@@ -38,10 +38,41 @@ docker run --rm \
   -e OPENWIKI_MODEL_ID=claude-sonnet \
   -e ANTHROPIC_API_KEY \
   openwiki-container:local \
-  code --update --print
+  code --init --print
 ```
 
-If the run succeeds, generated documentation appears directly in the mounted repository on the host.
+If the run succeeds, OpenWiki writes its generated output directly into the mounted repository on the host.
+
+For the first run on a repository that does not already have OpenWiki documentation, use `--init`.
+
+For later incremental runs on a repository that already has OpenWiki documentation and new commits to document, use `--update`.
+
+If an `init` run does not include a freeform instruction message, the container injects a built-in bootstrap prompt that tells OpenWiki to produce comprehensive, source-grounded repository documentation rather than stopping at a bare plan or next-step suggestion.
+
+Observed behavior in a real repository:
+
+- `code --init --print` created `openwiki/_skeleton.md` and recorded the documented Git head
+- a later `code --update --print` on the same unchanged commit reported that the wiki was already current
+
+So `--init` should currently be treated as wiki bootstrap, and `--update` should be treated as incremental maintenance after new commits.
+
+If you want richer initial content rather than only a skeleton, try providing an explicit instruction message on the init run:
+
+```bash
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:/repo" \
+  -w /repo \
+  -e OPENWIKI_PROVIDER \
+  -e OPENWIKI_MODEL_ID \
+  -e OPENAI_API_KEY \
+  openwiki-container:local \
+  code --init --print "Expand the OpenWiki skeleton into full documentation pages for this repository."
+```
+
+If you want to change the container-owned default bootstrap instruction without passing a positional prompt each time, set `OPENWIKI_INIT_MESSAGE`.
+
+The built-in image default is defined in [scripts/entrypoint.sh](scripts/entrypoint.sh) as the multiline `DEFAULT_INIT_MESSAGE` block.
 
 Validated OpenAI example from this repo:
 
@@ -70,6 +101,25 @@ Required in non-interactive CI-style runs:
 
 - `OPENWIKI_PROVIDER`
 - `OPENWIKI_MODEL_ID`
+
+Optional container-owned selector:
+
+- `OPENWIKI_RUN_MODE=auto|init|update`
+- `OPENWIKI_INIT_MESSAGE=<custom bootstrap instruction>`
+
+Mode behavior:
+
+- `auto` chooses `init` when no OpenWiki state is present
+- `auto` chooses `update` when `openwiki/.last-update.json` exists
+- `auto` also treats `openwiki/_skeleton.md` as initialized state and chooses `update`
+- `init` forces bootstrap mode
+- `update` forces incremental-update mode
+- when the resolved mode is `init` and no freeform instruction message was supplied, the container appends a built-in detailed documentation brief
+
+Prompt customization guidance:
+
+- for normal usage, override the bootstrap prompt with `OPENWIKI_INIT_MESSAGE`
+- if you maintain this container and want to change the image-wide default, edit the multiline `DEFAULT_INIT_MESSAGE` block in [scripts/entrypoint.sh](scripts/entrypoint.sh)
 
 Provider-specific environment variables are passed through unchanged. Use the OpenWiki documentation for the pinned OpenWiki version in this image to determine the correct variables for your provider.
 
@@ -162,7 +212,10 @@ The intended CI pattern is:
 1. check out the repository with full Git history
 2. mount that workspace into the container at `/repo`
 3. inject provider/model selection and provider credentials at runtime
-4. run the container
+4. run the container with:
+   - `OPENWIKI_RUN_MODE=auto` for normal automation
+   - `OPENWIKI_RUN_MODE=init` only when forcing bootstrap
+   - `OPENWIKI_RUN_MODE=update` only when forcing an incremental run
 5. inspect the resulting Git diff outside the container
 
 Minimal GitHub Actions shape:
@@ -176,6 +229,7 @@ Minimal GitHub Actions shape:
   env:
     OPENWIKI_PROVIDER: anthropic
     OPENWIKI_MODEL_ID: claude-sonnet
+    OPENWIKI_RUN_MODE: auto
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   run: |
     docker run --rm \
@@ -184,12 +238,17 @@ Minimal GitHub Actions shape:
       -w /repo \
       -e OPENWIKI_PROVIDER \
       -e OPENWIKI_MODEL_ID \
+      -e OPENWIKI_RUN_MODE \
       -e ANTHROPIC_API_KEY \
       openwiki-container:local \
-      code --update --print
+      code --print
 ```
 
 Set provider and model explicitly in CI for deterministic behavior.
+
+For automated CI usage, prefer `OPENWIKI_RUN_MODE=auto` and a neutral command such as `code --print`. The container will choose `--init` or `--update` based on repository state.
+
+If you want deterministic bootstrap guidance in CI across many repositories, set `OPENWIKI_INIT_MESSAGE` in the workflow env.
 
 ## Testing
 
@@ -254,6 +313,24 @@ Provider authentication or model errors from OpenWiki
 - verify that the selected model is valid for the chosen provider
 - verify that required network access or internal gateway configuration exists
 
+`code --update --print` did not create `openwiki/`
+
+- use `code --init --print` for the first run on a repository that does not already have OpenWiki documentation
+- use `code --update --print` only after the initial wiki has been created and new commits exist to document
+- or set `OPENWIKI_RUN_MODE=auto` and let the container choose based on repository state
+
+`code --init --print` created only `openwiki/_skeleton.md`
+
+- this is a valid observed OpenWiki bootstrap behavior
+- the container now injects a built-in detailed bootstrap instruction when no init message is supplied
+- try rerunning init with an explicit instruction message, or set `OPENWIKI_INIT_MESSAGE`, if you want a different first-pass documentation emphasis
+- otherwise commit the scaffold and use `code --update --print` after future repository changes
+
+`unable to auto-select OpenWiki mode`
+
+- this means `openwiki/` exists but the repository does not contain the expected OpenWiki state files
+- set `OPENWIKI_RUN_MODE=init` or `OPENWIKI_RUN_MODE=update` explicitly for that run
+
 `failed to connect to the docker API`
 
 - start the Docker daemon locally
@@ -261,9 +338,9 @@ Provider authentication or model errors from OpenWiki
 
 ## Repository contents
 
-- [Dockerfile](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/Dockerfile)
-- [scripts/entrypoint.sh](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/scripts/entrypoint.sh)
-- [scripts/smoke-test.sh](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/scripts/smoke-test.sh)
-- [tests/run-tests.sh](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/tests/run-tests.sh)
-- [tests/run-openwiki-e2e.sh](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/tests/run-openwiki-e2e.sh)
-- [.github/workflows/build.yml](/Users/harshadmane/Desktop/GitHub/github-workflow-openwiki-container/.github/workflows/build.yml)
+- [Dockerfile](Dockerfile)
+- [scripts/entrypoint.sh](scripts/entrypoint.sh)
+- [scripts/smoke-test.sh](scripts/smoke-test.sh)
+- [tests/run-tests.sh](tests/run-tests.sh)
+- [tests/run-openwiki-e2e.sh](tests/run-openwiki-e2e.sh)
+- [.github/workflows/build.yml](.github/workflows/build.yml)
